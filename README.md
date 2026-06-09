@@ -26,16 +26,16 @@
 
 **故障切换流程（Failover）**：
 1. Keepalived 每 3s 检测 `systemctl is-active strongswan`，连续 10 次失败（约 30s）触发切换
-2. Slave 进入 MASTER 状态，通过 AWS CLI 将 EIP 从 Master 漂移到自身（使用 AllocationId）
-3. Slave 重启 StrongSwan 重建 VPN 隧道
-4. SNS 发送故障告警邮件
+2. Slave 进入 MASTER 状态，**先**通过 AWS CLI 将 EIP 从 Master 漂移到自身
+3. EIP 迁移完成（sleep 3s）后，Slave 重启 StrongSwan、发起 IKE 协商建立隧道
+4. Slave 更新 VPC 路由表，使对端流量经由 Slave 转发
+5. SNS 发送故障告警邮件
 
 **手动回切流程（Failback）**：
-1. 确认 Master 节点已完全恢复
+1. 确认 Master StrongSwan 已恢复：`sudo systemctl start strongswan`（在 Master 执行）
 2. 在 Slave 上停止 Keepalived：`sudo systemctl stop keepalived`
-3. Master 检测到 Slave 不再发送 VRRP 报文，进入 MASTER 状态
-4. Master 的 `notify_master` 脚本自动重启 StrongSwan、漂回 EIP、发送告警
-5. Slave 重新启动 Keepalived：`sudo systemctl start keepalived`
+3. Master 收到 priority 0 广播（或超时），进入 MASTER 状态，**先**漂回 EIP，再重建隧道
+4. 确认 EIP 和隧道恢复后，重启 Slave Keepalived：`sudo systemctl start keepalived`
 
 > **设计说明**：Master 配置了 `nopreempt`，故障恢复后不会自动抢占，需手动 failback。
 > 这样可以避免网络抖动时的频繁切换（脑裂风险），运维人员可在确认 Master 完全健康后再执行回切。
@@ -47,9 +47,7 @@
 | 模板 | 用途 |
 |------|------|
 | `strongswan-main-china-new-vpc.yaml` | HA VPN 主端，**自动新建 VPC**（推荐快速体验） |
-| `strongswan-main-china-existing-vpc.yaml` | HA VPN 主端，接入已有 VPC |
 | `strongswan-on-prem-test-new-vpc.yaml` | 模拟对端（无真实本地机房时），自动新建 VPC |
-| `strongswan-on-prem-test-existing-vpc.yaml` | 模拟对端，接入已有 VPC |
 
 ---
 
@@ -66,7 +64,7 @@
 | LocalSubnet | 模拟本地端网段 | `172.16.0.0/16` |
 | RemoteServerIP | **先填占位符**，步骤 2 部署后再更新 | `1.2.3.4` |
 | RemoteSubnet | HA VPN 端 VPC 网段 | `10.50.0.0/16` |
-| IPSecSharedSecret | 预共享密钥（两端一致，≥8 位） | 自定义 |
+| IPSecSharedSecret | 预共享密钥（两端一致，≥20 位） | 自定义 |
 
 部署完成后，记录 Output `OnPremPublicIP`。
 
@@ -89,59 +87,78 @@
 
 ### 步骤 3：回填对端 IP 并更新 on-prem 端
 
-用步骤 2 的 `VPNPublicIP` 更新步骤 1 模板的 `RemoteServerIP` 参数，重新部署。
+用步骤 2 的 `VPNPublicIP` 更新步骤 1 模板的 `RemoteServerIP` 参数，重新部署（Stack Update）。
 
 ### 步骤 4：验证连通性
 
-登录任一 VPN 实例（SSM Session Manager 或 SSH）：
+登录 Master VPN 实例（SSM Session Manager）：
 
 ```bash
-# 查看 StrongSwan 状态
+# 查看 StrongSwan 隧道状态（期望 ESTABLISHED）
 swanctl --list-sas
 
-# 期望输出（ESTABLISHED 表示隧道已建立）
-# site-to-site{1}: INSTALLED, TUNNEL ...
-# site-to-site[1]: ESTABLISHED 23 seconds ago
-
-# 查看 SA 详情
-swanctl --list-conns
-swanctl --list-sas
+# 查看 Keepalived 状态（Master 应为 MASTER STATE，priority 120）
+journalctl -u keepalived -n 20
 
 # Ping 对端私有 IP 验证连通性
 ping <对端 VPN 实例私有 IP>
+```
+
+登录 Slave VPN 实例确认待机状态：
+
+```bash
+# Slave StrongSwan 守护进程应为 active（无活跃隧道，start_action = none）
+systemctl is-active strongswan
+
+# Slave Keepalived 应为 BACKUP STATE，priority 100
+journalctl -u keepalived -n 10
 ```
 
 ---
 
 ## 故障切换测试
 
-在 Master 节点上停止 StrongSwan 模拟故障：
+### 1. 模拟 Master 故障
+
+在 Master 节点上停止 StrongSwan：
 
 ```bash
 sudo systemctl stop strongswan
 ```
 
-观察 Keepalived 状态（约 30s 触发切换）：
+Keepalived 每 3s 检测一次，连续 10 次失败（约 30s）后触发切换。观察日志：
 
 ```bash
-sudo systemctl status keepalived -l
+# Master 上查看 priority 下降
 sudo journalctl -u keepalived -f
+# 期望：Changing effective priority from 120 to 90
+
+# Slave 上观察接管过程
+sudo journalctl -u keepalived -f
+# 期望：Changing effective priority from 100 to 100（StrongSwan 保持运行）
+# 期望：received lower priority (90) advert from <MasterIP> - discarding
+# 期望：Entering MASTER STATE
 ```
 
-切换成功后验证：
-- 控制台查看 EIP 已关联到 Slave 实例
+切换成功后验证（约 30s～3min）：
+- AWS 控制台确认 EIP 已关联到 Slave 实例
 - 检查 SNS 告警邮件
-- 从 on-prem 端 Ping 对端，验证连通性恢复
+- 从 on-prem 端 Ping Slave 私有 IP，验证连通性恢复
 
-**手动 Failback**（测试完后）：
+### 2. 手动 Failback
 
 ```bash
-# 1. 先恢复 Master StrongSwan（会被 notify_master 自动处理，此步可跳过）
-# 2. 在 Slave 上停止 Keepalived，触发 Master 接管
-sudo systemctl stop keepalived   # 在 Slave 上执行
+# 第 1 步：在 Master 上恢复 StrongSwan（确保 Keepalived 健康检查通过）
+sudo systemctl start strongswan      # 在 Master 执行
 
-# 3. 确认 EIP 漂回 Master 后，重新启动 Slave Keepalived
-sudo systemctl start keepalived  # 在 Slave 上执行
+# 第 2 步：在 Slave 上停止 Keepalived，触发 Master 接管
+sudo systemctl stop keepalived       # 在 Slave 执行
+
+# 第 3 步：等待 EIP 漂回 Master（约 1～3 min），验证连通性
+ping <对端私有 IP>                   # 在 on-prem 或 Master 执行
+
+# 第 4 步：恢复 Slave Keepalived，使其重回 BACKUP 待机状态
+sudo systemctl start keepalived      # 在 Slave 执行
 ```
 
 ---
@@ -149,7 +166,7 @@ sudo systemctl start keepalived  # 在 Slave 上执行
 ## 常用运维命令
 
 ```bash
-# 查看 VPN 状态
+# 查看 VPN 隧道状态
 swanctl --list-sas
 
 # 重新加载配置（不中断隧道）
@@ -163,11 +180,19 @@ swanctl --initiate --child net
 # 查看 IKE 协商日志
 journalctl -u strongswan -f
 
-# 查看 Keepalived 状态
+# 查看 Keepalived 状态与切换日志
 systemctl status keepalived
-
-# 查看切换日志
 journalctl -u keepalived -f
+
+# 查看 EIP 当前关联实例（在任意实例执行）
+TOKEN=$(curl -s -X PUT "http://169.254.169.254/latest/api/token" \
+  -H "X-aws-ec2-metadata-token-ttl-seconds: 300")
+REGION=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN" \
+  http://169.254.169.254/latest/meta-data/placement/region)
+aws ec2 describe-addresses \
+  --filters "Name=public-ip,Values=<VPN_EIP>" \
+  --query 'Addresses[0].{InstanceId:InstanceId,AssocId:AssociationId}' \
+  --region $REGION
 ```
 
 ---
@@ -176,16 +201,47 @@ journalctl -u keepalived -f
 
 | 参数 | 默认值 | 说明 |
 |------|--------|------|
-| IKE 加密套件 | `aes256-sha2_256-ecp256` | IKEv2，AES-256 + SHA-256 + ECP-256（ECDH）|
+| IKE 加密套件 | `aes256-sha256-ecp256` | IKEv2，AES-256 + SHA-256 + ECP-256（ECDH）|
 | ESP 加密套件 | `aes256gcm128` | AES-256-GCM，AEAD 无需单独认证算法 |
 | IKE 生命周期 | `86400s`（24h） | |
 | SA 生命周期 | `3600s`（1h） | |
 | Keepalived 检测 | 每 3s，连续 10 次失败（约 30s）触发切换 | |
-| Keepalived 模式 | Master/Slave 均为 `state BACKUP`，Master priority 更高并启用 `nopreempt` | 手动 failback，避免网络抖动时频繁切换 |
+| Keepalived 模式 | Master/Slave 均为 `state BACKUP`；Master priority 120 + `nopreempt`；Slave priority 100 | |
+| Master start_action | `start` | 主动发起隧道 |
+| Slave start_action | `none` | 守护进程运行但不主动发起，由 notify_master 显式 initiate |
 
 ---
 
 ## HA 设计说明
+
+### Slave StrongSwan 为何保持运行而不停止？
+
+**背景**：Keepalived 使用 `weight -30` 的健康检查脚本（`systemctl is-active strongswan`）决定优先级：
+
+| 节点 | 正常 priority | StrongSwan 宕机后 priority |
+|------|--------------|--------------------------|
+| Master | 120 | 90（120 - 30） |
+| Slave | 100 | 70（100 - 30） |
+
+如果在 `notify_backup.sh` 中停止 Slave 的 StrongSwan，则：
+- Slave priority 降至 70 < Master degraded priority 90
+- Master 仍赢得选举，**Failover 永远不会触发**
+
+**正确设计**：`notify_backup.sh` 仅通过 `swanctl --terminate` 断开活跃隧道，保持 StrongSwan 守护进程运行。Slave 的 StrongSwan 配置为 `start_action = none`，不会主动向对端发起连接（对端 SG 也只允许来自 EIP 的流量，天然阻断），健康检查持续通过，priority 维持 100。
+
+当 Master StrongSwan 宕机：
+- Master priority 90 < Slave priority 100 → Slave 赢得选举 → Failover 正常触发 ✓
+
+### notify_master.sh 中 EIP 迁移须在 StrongSwan 之前
+
+**背景**：对端的安全组只允许来自 VPN EIP 的 UDP 500/4500 流量。如果 StrongSwan 先于 EIP 迁移启动，Slave 发出的 IKE_INIT 源 IP 是其原有公网 IP，会被对端 SG 拒绝，StrongSwan 5 次重传后放弃，导致隧道建立失败。
+
+**正确顺序**：
+1. 迁移 EIP 到本实例
+2. `sleep 3`（等待 EIP 绑定生效）
+3. 重启 StrongSwan + 发起隧道
+
+Master 的 `notify_master.sh`（failback 场景）同理。
 
 ### 为什么使用 nopreempt？
 
@@ -193,14 +249,9 @@ journalctl -u keepalived -f
 
 自动抢占的问题：
 - Master 恢复时若服务不稳定，会造成 EIP 来回漂移，VPN 频繁中断
-- 更严重的是：抢占触发后，Master 没有 EIP 绑定期间的连接状态，隧道可能无法立即重建
+- 抢占期间 EIP 未绑定，隧道无法立即重建
 
-本模板将 Master 和 Slave 都配置为 `state BACKUP`，Master 使用更高 priority 并启用 `nopreempt`。这样 `nopreempt` 不会被 Keepalived 清除。
-
-使用该模式后：
-- Master 宕机后由 Slave 稳定承载，不自动回切
-- 运维人员确认 Master 完全健康后，通过停止 Slave 的 Keepalived 触发手动 failback
-- `notify_master` 脚本确保 EIP 漂回和 StrongSwan 正确重启
+本模板将 Master 和 Slave 都配置为 `state BACKUP`，Master 使用更高 priority 并启用 `nopreempt`，故障恢复后不自动抢占，运维人员确认 Master 完全健康后再执行手动 failback。
 
 ### EIP 漂移机制
 
@@ -208,6 +259,21 @@ journalctl -u keepalived -f
 1. `describe-addresses` 获取当前 AllocationId 和 AssociationId
 2. `disassociate-address --association-id` 解绑当前关联
 3. `associate-address --allocation-id` 绑定到新实例
+
+---
+
+## 实测数据（cn-northwest-1，2026-06-09）
+
+| 指标 | 数值 |
+|------|------|
+| 正常状态隧道延迟（OnPrem → Master） | 0.27 ms |
+| Keepalived 检测到故障时间 | 约 30s（10 × 3s） |
+| Failover 总耗时（停 StrongSwan → 连通性恢复） | 约 3 min |
+| 故障切换后延迟（OnPrem → Slave） | 0.8 ms |
+| Failback 总耗时（停 Slave Keepalived → 连通性恢复） | 约 2.5 min |
+| Failback 后延迟（OnPrem → Master） | 0.23 ms |
+
+> Failover/Failback 耗时包含：Keepalived 检测（~30s）+ EIP 迁移 + StrongSwan 重启 + IKE 协商。
 
 ---
 

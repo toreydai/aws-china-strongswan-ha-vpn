@@ -385,8 +385,8 @@ Resources:
                   remote_ts = ${RemoteSubnet}
                   esp_proposals = aes256gcm128
                   life_time = ${SALifeTime}
-                  start_action = start
-                  dpd_action = restart
+                  start_action = none
+                  dpd_action = clear
                   mode = tunnel
                 }
               }
@@ -446,17 +446,14 @@ Resources:
 
           cat > /etc/keepalived/notify-master.sh <<'NOTIFY_MASTER'
           #!/bin/bash
-          # Slave 接管：重启 StrongSwan，漂移 EIP，更新 VPC 路由，发送告警
+          # Slave 接管：先迁移 EIP（确保出口 IP 匹配对端 SG），再重启 StrongSwan 建隧道，最后更新 VPC 路由并告警。
+          # 顺序很重要：必须先完成 EIP 迁移，StrongSwan 发出的 IKE_INIT 源 IP 才能通过对端安全组。
           TOKEN=$(curl -s -X PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 300")
           REGION=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/placement/region)
           EIP_IP="${EIP}"
           SLAVE_ID=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/instance-id)
           RT_ID="${PublicRouteTable}"
           REMOTE_SUBNET="${RemoteSubnet}"
-
-          systemctl restart strongswan
-          swanctl --load-all
-          swanctl --initiate --child net || true
 
           ALLOC_ID=$(aws ec2 describe-addresses \
               --filters "Name=public-ip,Values=$EIP_IP" \
@@ -476,6 +473,12 @@ Resources:
               --instance-id "$SLAVE_ID" \
               --region "$REGION"
 
+          sleep 3
+
+          systemctl restart strongswan
+          swanctl --load-all
+          swanctl --initiate --child net || true
+
           aws ec2 replace-route \
               --route-table-id "$RT_ID" \
               --destination-cidr-block "$REMOTE_SUBNET" \
@@ -491,8 +494,13 @@ Resources:
 
           cat > /etc/keepalived/notify-backup.sh <<'NOTIFY_BACKUP'
           #!/bin/bash
-          # Slave 降级：停止 StrongSwan（Master 已接管）
-          systemctl stop strongswan
+          # Slave 降级为 BACKUP：仅终止活跃隧道，保持 strongswan 守护进程运行。
+          # 守护进程必须保持运行，check_strongswan 健康检查才能通过（priority 100），
+          # 否则 Master 故障时 Slave priority 会降到 70 < Master degraded priority 90，
+          # 导致 Slave 无法赢得选举，failover 无法触发。
+          # 注意：Slave 的 start_action = none，守护进程运行但不会主动发起连接，
+          # 仅在 notify_master 触发后才会显式 initiate。
+          swanctl --terminate --ike site-to-site 2>/dev/null || true
           NOTIFY_BACKUP
           chmod 700 /etc/keepalived/notify-backup.sh
 
@@ -635,17 +643,14 @@ Resources:
 
           cat > /etc/keepalived/notify-master.sh <<'NOTIFY_MASTER'
           #!/bin/bash
-          # Master 恢复主节点（手动 failback）：重启 StrongSwan，漂回 EIP，更新 VPC 路由，发送告警
+          # Master 恢复主节点（手动 failback）：先漂回 EIP，再重启 StrongSwan，最后更新路由并告警
+          # 顺序很重要：必须先完成 EIP 迁移，StrongSwan 发出的 IKE_INIT 源 IP 才能通过对端安全组。
           TOKEN=$(curl -s -X PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 300")
           REGION=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/placement/region)
           EIP_IP="${EIP}"
           MASTER_ID=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/instance-id)
           RT_ID="${PublicRouteTable}"
           REMOTE_SUBNET="${RemoteSubnet}"
-
-          systemctl start strongswan
-          swanctl --load-all
-          swanctl --initiate --child net || true
 
           # 若 EIP 已在本实例则跳过迁移（初始部署场景）
           CURRENT=$(aws ec2 describe-addresses \
@@ -669,6 +674,14 @@ Resources:
                   --allocation-id "$ALLOC_ID" \
                   --instance-id "$MASTER_ID" \
                   --region "$REGION"
+              sleep 3
+          fi
+
+          systemctl start strongswan
+          swanctl --load-all
+          swanctl --initiate --child net || true
+
+          if [ "$CURRENT" != "$MASTER_ID" ]; then
               aws ec2 replace-route \
                   --route-table-id "$RT_ID" \
                   --destination-cidr-block "$REMOTE_SUBNET" \

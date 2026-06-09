@@ -1,0 +1,403 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'StrongSwan 本地端模拟（on-prem 测试用）— 单节点，IKEv2，Amazon Linux 2023，自动新建 VPC'
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: VPC 网络设置（新建）
+        Parameters:
+          - VPCCIDR
+          - OnPremSubnetCIDR
+          - OnPremPrivateIP
+          - LocalSubnet
+      - Label:
+          default: EC2 实例设置
+        Parameters:
+          - InstanceType
+          - KeypairName
+      - Label:
+          default: IPSec/IKEv2 设置（需与 HA VPN 端一致）
+        Parameters:
+          - IPSecSharedSecret
+          - IKELifeTime
+          - SALifeTime
+      - Label:
+          default: 对端（HA VPN）信息
+        Parameters:
+          - RemoteServerIP
+          - RemoteSubnet
+
+Parameters:
+  VPCCIDR:
+    Type: String
+    Default: '172.16.0.0/16'
+    AllowedPattern: '^(([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])\.){3}([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])(\/([0-9]|[1-2][0-9]|3[0-2]))$'
+    Description: 模拟本地端 VPC CIDR（与 HA VPN 端不重叠）
+
+  OnPremSubnetCIDR:
+    Type: String
+    Default: '172.16.0.0/24'
+    AllowedPattern: '^(([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])\.){3}([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])(\/([0-9]|[1-2][0-9]|3[0-2]))$'
+    Description: 模拟本地端公有子网 CIDR
+
+  OnPremPrivateIP:
+    Type: String
+    Default: '172.16.0.8'
+    Description: 模拟本地端 VPN 实例私有 IP
+
+  LocalSubnet:
+    Type: String
+    Default: '172.16.0.0/16'
+    AllowedPattern: '^(([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])\.){3}([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])(\/([0-9]|[1-2][0-9]|3[0-2]))$'
+    Description: 模拟本地端网段（通常与 VPCCIDR 一致）
+
+  RemoteServerIP:
+    Type: String
+    Description: HA VPN 端的 EIP（对端公网 IP）
+
+  RemoteSubnet:
+    Type: String
+    Default: '10.50.0.0/16'
+    AllowedPattern: '^(([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])\.){3}([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])(\/([0-9]|[1-2][0-9]|3[0-2]))$'
+    Description: HA VPN 端网段
+
+  IPSecSharedSecret:
+    Type: String
+    NoEcho: true
+    MinLength: 20
+    Description: IPSec 预共享密钥（需与 HA VPN 端一致，建议 32 位随机字符）
+
+  IKELifeTime:
+    Type: String
+    Default: '86400s'
+    Description: IKE SA 生命周期
+
+  SALifeTime:
+    Type: String
+    Default: '3600s'
+    Description: IPSec SA 生命周期
+
+  InstanceType:
+    Type: String
+    Default: t3.small
+    AllowedValues:
+      - t3.small
+      - t3.medium
+      - c5.large
+    Description: 模拟本地端实例规格（测试用 t3.small 即可）
+
+  KeypairName:
+    Type: String
+    Default: ''
+    Description: EC2 SSH 密钥对（可选，留空则仅 SSM 登录）
+
+Conditions:
+  HasKeyPair: !Not [!Equals [!Ref KeypairName, '']]
+
+Resources:
+  # ---- VPC ----
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !Ref VPCCIDR
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: OnPrem-Test-VPC
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: OnPrem-Test-IGW
+
+  VPCGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref VPC
+      InternetGatewayId: !Ref InternetGateway
+
+  OnPremSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: !Ref OnPremSubnetCIDR
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: OnPrem-Test-Subnet
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: OnPrem-Test-RT
+
+  PublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: VPCGatewayAttachment
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: '0.0.0.0/0'
+      GatewayId: !Ref InternetGateway
+
+  SubnetRTAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref OnPremSubnet
+      RouteTableId: !Ref PublicRouteTable
+
+  # ---- IAM ----
+  OnPremRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${AWS::StackName}-OnPremRole'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com.cn
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws-cn:iam::aws:policy/AmazonSSMManagedInstanceCore
+
+  OnPremInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles:
+        - !Ref OnPremRole
+
+  # ---- EIP ----
+  EIP:
+    Type: AWS::EC2::EIP
+    Properties:
+      Domain: vpc
+
+  EIPAssoc:
+    Type: AWS::EC2::EIPAssociation
+    Properties:
+      InstanceId: !Ref OnPremInstance
+      AllocationId: !GetAtt EIP.AllocationId
+
+  # ---- 安全组 ----
+  OnPremSG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: OnPrem StrongSwan Test Security Group
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: udp
+          FromPort: 500
+          ToPort: 500
+          CidrIp: !Sub '${RemoteServerIP}/32'
+          Description: IKE
+        - IpProtocol: udp
+          FromPort: 4500
+          ToPort: 4500
+          CidrIp: !Sub '${RemoteServerIP}/32'
+          Description: IPSec NAT-T
+      Tags:
+        - Key: Name
+          Value: OnPrem-StrongSwan-SG
+
+  # ---- EC2 实例 ----
+  OnPremInstance:
+    Type: AWS::EC2::Instance
+    Metadata:
+      AWS::CloudFormation::Init:
+        config:
+          files:
+            /etc/strongswan/swanctl/conf.d/site-to-site.conf:
+              mode: '000600'
+              owner: root
+              group: root
+              content: !Sub |
+                connections {
+                  site-to-site {
+                    version = 2
+                    local_addrs = ${OnPremPrivateIP}
+                    remote_addrs = ${RemoteServerIP}
+                    local {
+                      auth = psk
+                      id = ${EIP}
+                    }
+                    remote {
+                      auth = psk
+                      id = ${RemoteServerIP}
+                    }
+                    proposals = aes256-sha256-ecp256
+                    rekey_time = ${IKELifeTime}
+                    dpd_delay = 30s
+                    dpd_timeout = 120s
+                    children {
+                      net {
+                        local_ts = ${LocalSubnet}
+                        remote_ts = ${RemoteSubnet}
+                        esp_proposals = aes256gcm128
+                        life_time = ${SALifeTime}
+                        start_action = start
+                        dpd_action = restart
+                        mode = tunnel
+                      }
+                    }
+                  }
+                }
+
+            /etc/cfn/cfn-hup.conf:
+              mode: '000400'
+              owner: root
+              group: root
+              content: !Sub |
+                [main]
+                stack=${AWS::StackName}
+                region=${AWS::Region}
+                interval=1
+            /etc/cfn/hooks.d/cfn-auto-reloader.conf:
+              mode: '000400'
+              owner: root
+              group: root
+              content: !Sub |
+                [cfn-auto-reloader-hook]
+                triggers=post.update
+                path=Resources.OnPremInstance.Metadata.AWS::CloudFormation::Init
+                action=/opt/aws/bin/cfn-init -v --stack ${AWS::StackName} --resource OnPremInstance --region ${AWS::Region}
+                runas=root
+          commands:
+            01_restart_strongswan:
+              command: systemctl restart strongswan
+            02_load_swanctl:
+              command: swanctl --load-all
+            03_initiate_tunnel:
+              command: swanctl --initiate --child net || true
+          services:
+            systemd:
+              cfn-hup:
+                enabled: true
+                ensureRunning: true
+                files:
+                  - /etc/cfn/cfn-hup.conf
+                  - /etc/cfn/hooks.d/cfn-auto-reloader.conf
+    Properties:
+      InstanceType: !Ref InstanceType
+      IamInstanceProfile: !Ref OnPremInstanceProfile
+      PrivateIpAddress: !Ref OnPremPrivateIP
+      SourceDestCheck: false
+      SubnetId: !Ref OnPremSubnet
+      SecurityGroupIds:
+        - !Ref OnPremSG
+      KeyName: !If [HasKeyPair, !Ref KeypairName, !Ref 'AWS::NoValue']
+      ImageId: '{{resolve:ssm:/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64}}'
+      MetadataOptions:
+        HttpTokens: required
+        HttpPutResponseHopLimit: 1
+      BlockDeviceMappings:
+        - DeviceName: /dev/xvda
+          Ebs:
+            Encrypted: true
+            VolumeType: gp3
+      Tags:
+        - Key: Name
+          Value: OnPrem-StrongSwan-Test
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash -ex
+          trap '/opt/aws/bin/cfn-signal -e $? --stack ${AWS::StackName} --resource OnPremInstance --region ${AWS::Region}' EXIT
+          timedatectl set-timezone Asia/Shanghai
+          printf '[epel-tuna]\nname=EPEL TUNA\nbaseurl=https://mirrors.tuna.tsinghua.edu.cn/epel/9/Everything/x86_64/\nenabled=1\ngpgcheck=0\n' > /etc/yum.repos.d/epel-tuna.repo
+          dnf install -y --setopt=timeout=20 --setopt=retries=3 strongswan iptables-services
+          rm -f /etc/yum.repos.d/epel-tuna.repo
+
+          cat > /etc/sysctl.d/99-vpn.conf <<'SYSCTL'
+          net.ipv4.ip_forward = 1
+          net.ipv4.conf.all.accept_redirects = 0
+          net.ipv4.conf.all.send_redirects = 0
+          net.ipv4.conf.default.rp_filter = 0
+          net.ipv4.conf.all.rp_filter = 0
+          SYSCTL
+          sysctl --system
+
+          PUBLIC_IP=${EIP}
+
+          mkdir -p /etc/strongswan/swanctl/conf.d
+          cat > /etc/strongswan/swanctl/conf.d/site-to-site.conf <<SWANCTL
+          connections {
+            site-to-site {
+              version = 2
+              local_addrs = ${OnPremPrivateIP}
+              remote_addrs = ${RemoteServerIP}
+              local {
+                auth = psk
+                id = $PUBLIC_IP
+              }
+              remote {
+                auth = psk
+                id = ${RemoteServerIP}
+              }
+              proposals = aes256-sha256-ecp256
+              rekey_time = ${IKELifeTime}
+              dpd_delay = 30s
+              dpd_timeout = 120s
+              children {
+                net {
+                  local_ts = ${LocalSubnet}
+                  remote_ts = ${RemoteSubnet}
+                  esp_proposals = aes256gcm128
+                  life_time = ${SALifeTime}
+                  start_action = start
+                  dpd_action = restart
+                  mode = tunnel
+                }
+              }
+            }
+          }
+
+          secrets {
+            ike-site-to-site {
+              id-1 = $PUBLIC_IP
+              id-2 = %any
+              secret = "${IPSecSharedSecret}"
+            }
+          }
+          SWANCTL
+          chmod 600 /etc/strongswan/swanctl/conf.d/site-to-site.conf
+          cat > /etc/strongswan/swanctl/conf.d/secrets.conf <<SECRETS
+          secrets {
+            ike-site-to-site {
+              id-1 = $PUBLIC_IP
+              id-2 = ${RemoteServerIP}
+              secret = "${IPSecSharedSecret}"
+            }
+          }
+          SECRETS
+          chmod 600 /etc/strongswan/swanctl/conf.d/secrets.conf
+
+          IFACE=$(ip route show default | awk '{print $5}' | head -1)
+          iptables -t mangle -A FORWARD -o "$IFACE" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss 1387
+          iptables-save > /etc/sysconfig/iptables
+          systemctl enable --now iptables
+          systemctl enable --now strongswan
+          /opt/aws/bin/cfn-init -v --stack ${AWS::StackName} --resource OnPremInstance --region ${AWS::Region}
+          swanctl --load-all
+          swanctl --initiate --child net || true
+
+    CreationPolicy:
+      ResourceSignal:
+        Count: 1
+        Timeout: PT8M
+
+Outputs:
+  OnPremPublicIP:
+    Description: 模拟本地端公网 IP（填入 HA VPN 模板的 RemoteServerIP）
+    Value: !Ref EIP
+  OnPremPrivateIP:
+    Description: 模拟本地端私有 IP
+    Value: !GetAtt OnPremInstance.PrivateIp
+  VPCID:
+    Description: 新建 VPC ID
+    Value: !Ref VPC

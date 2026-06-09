@@ -1,0 +1,710 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'StrongSwan HA VPN on AWS China — IKEv2, Amazon Linux 2023, 自动新建 VPC'
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: VPC 网络设置（新建）
+        Parameters:
+          - CustomIdentifier
+          - VPCCIDR
+          - MasterSubnetCIDR
+          - SlaveSubnetCIDR
+          - LocalSubnet
+      - Label:
+          default: EC2 实例设置
+        Parameters:
+          - InstanceType
+          - KeypairName
+          - MasterPrivateIP
+          - SlavePrivateIP
+          - SNSEmail
+      - Label:
+          default: IPSec/IKEv2 设置
+        Parameters:
+          - IPSecSharedSecret
+          - IKELifeTime
+          - SALifeTime
+      - Label:
+          default: Keepalived 设置
+        Parameters:
+          - KeepalivedAuthPass
+      - Label:
+          default: 远端数据中心
+        Parameters:
+          - RemoteServerIP
+          - RemoteSubnet
+
+Parameters:
+  CustomIdentifier:
+    Type: String
+    Default: StrongSwan
+    Description: 资源名称前缀
+
+  VPCCIDR:
+    Type: String
+    Default: '10.50.0.0/16'
+    AllowedPattern: '^(([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])\.){3}([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])(\/([0-9]|[1-2][0-9]|3[0-2]))$'
+    Description: 新建 VPC CIDR
+
+  MasterSubnetCIDR:
+    Type: String
+    Default: '10.50.0.0/24'
+    AllowedPattern: '^(([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])\.){3}([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])(\/([0-9]|[1-2][0-9]|3[0-2]))$'
+    Description: Master 节点公有子网 CIDR（可用区 A）
+
+  SlaveSubnetCIDR:
+    Type: String
+    Default: '10.50.1.0/24'
+    AllowedPattern: '^(([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])\.){3}([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])(\/([0-9]|[1-2][0-9]|3[0-2]))$'
+    Description: Slave 节点公有子网 CIDR（可用区 B）
+
+  LocalSubnet:
+    Type: String
+    Default: '10.50.0.0/16'
+    AllowedPattern: '^(([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])\.){3}([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])(\/([0-9]|[1-2][0-9]|3[0-2]))$'
+    Description: 本端 VPC 网段（通常与 VPCCIDR 一致）
+
+  MasterPrivateIP:
+    Type: String
+    Default: '10.50.0.8'
+    Description: Master 节点私有 IP（需在 MasterSubnetCIDR 范围内）
+
+  SlavePrivateIP:
+    Type: String
+    Default: '10.50.1.8'
+    Description: Slave 节点私有 IP（需在 SlaveSubnetCIDR 范围内）
+
+  RemoteServerIP:
+    Type: String
+    Description: 对端 VPN 网关公网 IP
+
+  RemoteSubnet:
+    Type: String
+    Default: '172.16.0.0/16'
+    AllowedPattern: '^(([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])\.){3}([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])(\/([0-9]|[1-2][0-9]|3[0-2]))$'
+    Description: 对端网络网段
+
+  IPSecSharedSecret:
+    Type: String
+    NoEcho: true
+    MinLength: 20
+    Description: IPSec 预共享密钥（建议 32 位随机字符）
+
+  IKELifeTime:
+    Type: String
+    Default: '86400s'
+    Description: IKE SA 生命周期
+
+  SALifeTime:
+    Type: String
+    Default: '3600s'
+    Description: IPSec SA 生命周期
+
+  KeepalivedAuthPass:
+    Type: String
+    NoEcho: true
+    MinLength: 8
+    MaxLength: 8
+    Description: Keepalived VRRP 认证密码（8 位，两节点一致）
+
+  InstanceType:
+    Type: String
+    Default: c5.large
+    AllowedValues:
+      - t3.small
+      - t3.medium
+      - c5.large
+      - c5.xlarge
+      - c5.2xlarge
+      - m5.large
+      - m5.xlarge
+    Description: StrongSwan 实例规格
+
+  KeypairName:
+    Type: String
+    Default: ''
+    Description: EC2 SSH 密钥对（可选，留空则仅 SSM 登录）
+
+  SNSEmail:
+    Type: String
+    Default: 'admin@example.com'
+    Description: 故障切换告警邮件地址
+
+Conditions:
+  HasKeyPair: !Not [!Equals [!Ref KeypairName, '']]
+
+Resources:
+  # ---- VPC ----
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !Ref VPCCIDR
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${CustomIdentifier}-VPC'
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: !Sub '${CustomIdentifier}-IGW'
+
+  VPCGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref VPC
+      InternetGatewayId: !Ref InternetGateway
+
+  MasterSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: !Ref MasterSubnetCIDR
+      AvailabilityZone: !Select [0, !GetAZs '']
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${CustomIdentifier}-Master-Subnet'
+
+  SlaveSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: !Ref SlaveSubnetCIDR
+      AvailabilityZone: !Select [1, !GetAZs '']
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${CustomIdentifier}-Slave-Subnet'
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub '${CustomIdentifier}-Public-RT'
+
+  PublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: VPCGatewayAttachment
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: '0.0.0.0/0'
+      GatewayId: !Ref InternetGateway
+
+  MasterSubnetRTAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref MasterSubnet
+      RouteTableId: !Ref PublicRouteTable
+
+  SlaveSubnetRTAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref SlaveSubnet
+      RouteTableId: !Ref PublicRouteTable
+
+  # ---- 对端网段路由（初始指向 Master，故障切换时由脚本更新）----
+  RemoteSubnetRoute:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: !Ref RemoteSubnet
+      InstanceId: !Ref MasterInstance
+
+  # ---- IAM ----
+  StrongSwanRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${CustomIdentifier}-StrongSwanRole'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com.cn
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws-cn:iam::aws:policy/AmazonSSMManagedInstanceCore
+      Policies:
+        - PolicyName: StrongSwanFailoverPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ec2:DescribeAddresses
+                  - ec2:DescribeInstances
+                  - ec2:DescribeRouteTables
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - ec2:DisassociateAddress
+                Resource: !Sub 'arn:aws-cn:ec2:${AWS::Region}:${AWS::AccountId}:elastic-ip/${EIP.AllocationId}'
+              - Effect: Allow
+                Action:
+                  - ec2:AssociateAddress
+                Resource:
+                  - !Sub 'arn:aws-cn:ec2:${AWS::Region}:${AWS::AccountId}:elastic-ip/${EIP.AllocationId}'
+                  - !Sub 'arn:aws-cn:ec2:${AWS::Region}:${AWS::AccountId}:network-interface/*'
+                  - !Sub 'arn:aws-cn:ec2:${AWS::Region}:${AWS::AccountId}:instance/*'
+              - Effect: Allow
+                Action:
+                  - ec2:ReplaceRoute
+                  - ec2:CreateRoute
+                Resource: !Sub 'arn:aws-cn:ec2:${AWS::Region}:${AWS::AccountId}:route-table/${PublicRouteTable}'
+              - Effect: Allow
+                Action:
+                  - sns:Publish
+                Resource: !Ref StrongSwanSNSTopic
+
+  StrongSwanInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles:
+        - !Ref StrongSwanRole
+
+  # ---- EIP ----
+  EIP:
+    Type: AWS::EC2::EIP
+    Properties:
+      Domain: vpc
+
+  # EIPAssoc 由 keepalived notify-master.sh 脚本管理（避免与故障切换脚本冲突）
+
+  # ---- 安全组 ----
+  StrongSwanSG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: StrongSwan VPN Security Group
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: udp
+          FromPort: 500
+          ToPort: 500
+          CidrIp: !Sub '${RemoteServerIP}/32'
+          Description: IKE
+        - IpProtocol: udp
+          FromPort: 4500
+          ToPort: 4500
+          CidrIp: !Sub '${RemoteServerIP}/32'
+          Description: IPSec NAT-T
+        - IpProtocol: '50'
+          CidrIp: !Sub '${RemoteServerIP}/32'
+          Description: ESP
+      Tags:
+        - Key: Name
+          Value: !Sub '${CustomIdentifier}-StrongSwan-SG'
+
+  # ---- SNS ----
+  StrongSwanSNSTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      DisplayName: !Sub '${CustomIdentifier}-VPN-HA-Alert'
+      TopicName: !Sub '${CustomIdentifier}-VPN-HA-Alert'
+
+  StrongSwanSNSSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      Endpoint: !Ref SNSEmail
+      Protocol: email
+      TopicArn: !Ref StrongSwanSNSTopic
+
+  # ---- Slave 实例 ----
+  SlaveInstance:
+    Type: AWS::EC2::Instance
+    Properties:
+      InstanceType: !Ref InstanceType
+      IamInstanceProfile: !Ref StrongSwanInstanceProfile
+      PrivateIpAddress: !Ref SlavePrivateIP
+      SourceDestCheck: false
+      SubnetId: !Ref SlaveSubnet
+      SecurityGroupIds:
+        - !Ref StrongSwanSG
+      KeyName: !If [HasKeyPair, !Ref KeypairName, !Ref 'AWS::NoValue']
+      ImageId: '{{resolve:ssm:/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64}}'
+      MetadataOptions:
+        HttpTokens: required
+        HttpPutResponseHopLimit: 1
+      BlockDeviceMappings:
+        - DeviceName: /dev/xvda
+          Ebs:
+            Encrypted: true
+            VolumeType: gp3
+      Tags:
+        - Key: Name
+          Value: !Sub '${CustomIdentifier}-StrongSwan-Slave'
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash -ex
+          trap '/opt/aws/bin/cfn-signal -e $? --stack ${AWS::StackName} --resource SlaveInstance --region ${AWS::Region}' EXIT
+          timedatectl set-timezone Asia/Shanghai
+          printf '[epel-tuna]\nname=EPEL TUNA\nbaseurl=https://mirrors.tuna.tsinghua.edu.cn/epel/9/Everything/x86_64/\nenabled=1\ngpgcheck=0\n' > /etc/yum.repos.d/epel-tuna.repo
+          dnf install -y --setopt=timeout=20 --setopt=retries=3 strongswan keepalived iptables-services
+          rm -f /etc/yum.repos.d/epel-tuna.repo
+
+          cat > /etc/sysctl.d/99-vpn.conf <<'SYSCTL'
+          net.ipv4.ip_forward = 1
+          net.ipv4.conf.all.accept_redirects = 0
+          net.ipv4.conf.all.send_redirects = 0
+          net.ipv4.conf.default.rp_filter = 0
+          net.ipv4.conf.all.rp_filter = 0
+          SYSCTL
+          sysctl --system
+
+          PUBLIC_IP=${EIP}
+
+          mkdir -p /etc/strongswan/swanctl/conf.d
+          cat > /etc/strongswan/swanctl/conf.d/site-to-site.conf <<SWANCTL
+          connections {
+            site-to-site {
+              version = 2
+              local_addrs = ${SlavePrivateIP}
+              remote_addrs = ${RemoteServerIP}
+              local {
+                auth = psk
+                id = $PUBLIC_IP
+              }
+              remote {
+                auth = psk
+                id = ${RemoteServerIP}
+              }
+              proposals = aes256-sha256-ecp256
+              rekey_time = ${IKELifeTime}
+              dpd_delay = 30s
+              dpd_timeout = 120s
+              children {
+                net {
+                  local_ts = ${LocalSubnet}
+                  remote_ts = ${RemoteSubnet}
+                  esp_proposals = aes256gcm128
+                  life_time = ${SALifeTime}
+                  start_action = start
+                  dpd_action = restart
+                  mode = tunnel
+                }
+              }
+            }
+          }
+
+          secrets {
+            ike-site-to-site {
+              id-1 = $PUBLIC_IP
+              id-2 = ${RemoteServerIP}
+              secret = "${IPSecSharedSecret}"
+            }
+          }
+          SWANCTL
+          chmod 600 /etc/strongswan/swanctl/conf.d/site-to-site.conf
+
+          IFACE=$(ip route show default | awk '{print $5}' | head -1)
+          iptables -t mangle -A FORWARD -o "$IFACE" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss 1387
+          iptables-save > /etc/sysconfig/iptables
+          systemctl enable --now iptables
+          systemctl enable --now strongswan
+          swanctl --load-all
+
+          cat > /etc/keepalived/keepalived.conf <<KEEPALIVED
+          global_defs {
+              script_user root
+              enable_script_security
+          }
+          vrrp_script check_strongswan {
+              script "systemctl is-active strongswan"
+              interval 3
+              fall 10
+              rise 10
+              weight -30
+          }
+          vrrp_instance StrongSwan {
+              state BACKUP
+              interface $IFACE
+              virtual_router_id 51
+              priority 100
+              advert_int 1
+              unicast_src_ip ${SlavePrivateIP}
+              unicast_peer {
+                  ${MasterPrivateIP}
+              }
+              authentication {
+                  auth_type PASS
+                  auth_pass ${KeepalivedAuthPass}
+              }
+              track_script {
+                  check_strongswan
+              }
+              notify_master "/etc/keepalived/notify-master.sh"
+              notify_backup "/etc/keepalived/notify-backup.sh"
+          }
+          KEEPALIVED
+
+          cat > /etc/keepalived/notify-master.sh <<'NOTIFY_MASTER'
+          #!/bin/bash
+          # Slave 接管：重启 StrongSwan，漂移 EIP，更新 VPC 路由，发送告警
+          TOKEN=$(curl -s -X PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 300")
+          REGION=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/placement/region)
+          EIP_IP="${EIP}"
+          SLAVE_ID=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/instance-id)
+          RT_ID="${PublicRouteTable}"
+          REMOTE_SUBNET="${RemoteSubnet}"
+
+          systemctl restart strongswan
+          swanctl --load-all
+          swanctl --initiate --child net || true
+
+          ALLOC_ID=$(aws ec2 describe-addresses \
+              --filters "Name=public-ip,Values=$EIP_IP" \
+              --query 'Addresses[0].AllocationId' \
+              --output text --region "$REGION")
+          ASSOC_ID=$(aws ec2 describe-addresses \
+              --filters "Name=public-ip,Values=$EIP_IP" \
+              --query 'Addresses[0].AssociationId' \
+              --output text --region "$REGION")
+
+          if [ "$ASSOC_ID" != "None" ] && [ -n "$ASSOC_ID" ]; then
+              aws ec2 disassociate-address --association-id "$ASSOC_ID" --region "$REGION"
+              sleep 2
+          fi
+          aws ec2 associate-address \
+              --allocation-id "$ALLOC_ID" \
+              --instance-id "$SLAVE_ID" \
+              --region "$REGION"
+
+          aws ec2 replace-route \
+              --route-table-id "$RT_ID" \
+              --destination-cidr-block "$REMOTE_SUBNET" \
+              --instance-id "$SLAVE_ID" \
+              --region "$REGION"
+
+          aws sns publish \
+              --topic-arn "${StrongSwanSNSTopic}" \
+              --message "StrongSwan HA: Master 故障，EIP $EIP_IP 及 VPC 路由已切换到 Slave ($SLAVE_ID)" \
+              --region "$REGION"
+          NOTIFY_MASTER
+          chmod 700 /etc/keepalived/notify-master.sh
+
+          cat > /etc/keepalived/notify-backup.sh <<'NOTIFY_BACKUP'
+          #!/bin/bash
+          # Slave 降级：停止 StrongSwan（Master 已接管）
+          systemctl stop strongswan
+          NOTIFY_BACKUP
+          chmod 700 /etc/keepalived/notify-backup.sh
+
+          # Let Master get the first election while both instances are created in parallel.
+          sleep 90
+          systemctl enable --now keepalived
+    CreationPolicy:
+      ResourceSignal:
+        Count: 1
+        Timeout: PT8M
+
+  # ---- Master 实例 ----
+  MasterInstance:
+    Type: AWS::EC2::Instance
+    Properties:
+      InstanceType: !Ref InstanceType
+      IamInstanceProfile: !Ref StrongSwanInstanceProfile
+      PrivateIpAddress: !Ref MasterPrivateIP
+      SourceDestCheck: false
+      SubnetId: !Ref MasterSubnet
+      SecurityGroupIds:
+        - !Ref StrongSwanSG
+      KeyName: !If [HasKeyPair, !Ref KeypairName, !Ref 'AWS::NoValue']
+      ImageId: '{{resolve:ssm:/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64}}'
+      MetadataOptions:
+        HttpTokens: required
+        HttpPutResponseHopLimit: 1
+      BlockDeviceMappings:
+        - DeviceName: /dev/xvda
+          Ebs:
+            Encrypted: true
+            VolumeType: gp3
+      Tags:
+        - Key: Name
+          Value: !Sub '${CustomIdentifier}-StrongSwan-Master'
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash -ex
+          trap '/opt/aws/bin/cfn-signal -e $? --stack ${AWS::StackName} --resource MasterInstance --region ${AWS::Region}' EXIT
+          timedatectl set-timezone Asia/Shanghai
+          printf '[epel-tuna]\nname=EPEL TUNA\nbaseurl=https://mirrors.tuna.tsinghua.edu.cn/epel/9/Everything/x86_64/\nenabled=1\ngpgcheck=0\n' > /etc/yum.repos.d/epel-tuna.repo
+          dnf install -y --setopt=timeout=20 --setopt=retries=3 strongswan keepalived iptables-services
+          rm -f /etc/yum.repos.d/epel-tuna.repo
+
+          cat > /etc/sysctl.d/99-vpn.conf <<'SYSCTL'
+          net.ipv4.ip_forward = 1
+          net.ipv4.conf.all.accept_redirects = 0
+          net.ipv4.conf.all.send_redirects = 0
+          net.ipv4.conf.default.rp_filter = 0
+          net.ipv4.conf.all.rp_filter = 0
+          SYSCTL
+          sysctl --system
+
+          PUBLIC_IP=${EIP}
+
+          mkdir -p /etc/strongswan/swanctl/conf.d
+          cat > /etc/strongswan/swanctl/conf.d/site-to-site.conf <<SWANCTL
+          connections {
+            site-to-site {
+              version = 2
+              local_addrs = ${MasterPrivateIP}
+              remote_addrs = ${RemoteServerIP}
+              local {
+                auth = psk
+                id = $PUBLIC_IP
+              }
+              remote {
+                auth = psk
+                id = ${RemoteServerIP}
+              }
+              proposals = aes256-sha256-ecp256
+              rekey_time = ${IKELifeTime}
+              dpd_delay = 30s
+              dpd_timeout = 120s
+              children {
+                net {
+                  local_ts = ${LocalSubnet}
+                  remote_ts = ${RemoteSubnet}
+                  esp_proposals = aes256gcm128
+                  life_time = ${SALifeTime}
+                  start_action = start
+                  dpd_action = restart
+                  mode = tunnel
+                }
+              }
+            }
+          }
+
+          secrets {
+            ike-site-to-site {
+              id-1 = $PUBLIC_IP
+              id-2 = ${RemoteServerIP}
+              secret = "${IPSecSharedSecret}"
+            }
+          }
+          SWANCTL
+          chmod 600 /etc/strongswan/swanctl/conf.d/site-to-site.conf
+
+          IFACE=$(ip route show default | awk '{print $5}' | head -1)
+          iptables -t mangle -A FORWARD -o "$IFACE" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss 1387
+          iptables-save > /etc/sysconfig/iptables
+          systemctl enable --now iptables
+          systemctl enable --now strongswan
+          swanctl --load-all
+
+          cat > /etc/keepalived/keepalived.conf <<KEEPALIVED
+          global_defs {
+              script_user root
+              enable_script_security
+          }
+          vrrp_script check_strongswan {
+              script "systemctl is-active strongswan"
+              interval 3
+              fall 10
+              rise 10
+              weight -30
+          }
+          vrrp_instance StrongSwan {
+              state BACKUP
+              interface $IFACE
+              virtual_router_id 51
+              priority 120
+              nopreempt
+              advert_int 1
+              unicast_src_ip ${MasterPrivateIP}
+              unicast_peer {
+                  ${SlavePrivateIP}
+              }
+              authentication {
+                  auth_type PASS
+                  auth_pass ${KeepalivedAuthPass}
+              }
+              track_script {
+                  check_strongswan
+              }
+              notify_master "/etc/keepalived/notify-master.sh"
+              notify_backup "/etc/keepalived/notify-backup.sh"
+          }
+          KEEPALIVED
+
+          cat > /etc/keepalived/notify-master.sh <<'NOTIFY_MASTER'
+          #!/bin/bash
+          # Master 恢复主节点（手动 failback）：重启 StrongSwan，漂回 EIP，更新 VPC 路由，发送告警
+          TOKEN=$(curl -s -X PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 300")
+          REGION=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/placement/region)
+          EIP_IP="${EIP}"
+          MASTER_ID=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/instance-id)
+          RT_ID="${PublicRouteTable}"
+          REMOTE_SUBNET="${RemoteSubnet}"
+
+          systemctl start strongswan
+          swanctl --load-all
+          swanctl --initiate --child net || true
+
+          # 若 EIP 已在本实例则跳过迁移（初始部署场景）
+          CURRENT=$(aws ec2 describe-addresses \
+              --filters "Name=public-ip,Values=$EIP_IP" \
+              --query 'Addresses[0].InstanceId' \
+              --output text --region "$REGION")
+          if [ "$CURRENT" != "$MASTER_ID" ]; then
+              ALLOC_ID=$(aws ec2 describe-addresses \
+                  --filters "Name=public-ip,Values=$EIP_IP" \
+                  --query 'Addresses[0].AllocationId' \
+                  --output text --region "$REGION")
+              ASSOC_ID=$(aws ec2 describe-addresses \
+                  --filters "Name=public-ip,Values=$EIP_IP" \
+                  --query 'Addresses[0].AssociationId' \
+                  --output text --region "$REGION")
+              if [ "$ASSOC_ID" != "None" ] && [ -n "$ASSOC_ID" ]; then
+                  aws ec2 disassociate-address --association-id "$ASSOC_ID" --region "$REGION"
+                  sleep 2
+              fi
+              aws ec2 associate-address \
+                  --allocation-id "$ALLOC_ID" \
+                  --instance-id "$MASTER_ID" \
+                  --region "$REGION"
+              aws ec2 replace-route \
+                  --route-table-id "$RT_ID" \
+                  --destination-cidr-block "$REMOTE_SUBNET" \
+                  --instance-id "$MASTER_ID" \
+                  --region "$REGION"
+              aws sns publish \
+                  --topic-arn "${StrongSwanSNSTopic}" \
+                  --message "StrongSwan HA: Master 恢复，EIP $EIP_IP 及 VPC 路由已切回 Master ($MASTER_ID)" \
+                  --region "$REGION"
+          fi
+          NOTIFY_MASTER
+          chmod 700 /etc/keepalived/notify-master.sh
+
+          cat > /etc/keepalived/notify-backup.sh <<'NOTIFY_BACKUP'
+          #!/bin/bash
+          # Master 降级：停止 StrongSwan（Slave 将接管）
+          systemctl stop strongswan
+          NOTIFY_BACKUP
+          chmod 700 /etc/keepalived/notify-backup.sh
+
+          systemctl enable --now keepalived
+    CreationPolicy:
+      ResourceSignal:
+        Count: 1
+        Timeout: PT8M
+
+Outputs:
+  VPNPublicIP:
+    Description: VPN 对外统一公网 IP（故障切换后漂移到 Slave；手动 failback 后漂回 Master）
+    Value: !Ref EIP
+  VPCID:
+    Description: 新建 VPC ID
+    Value: !Ref VPC
+  MasterPrivateIP:
+    Description: Master 节点私有 IP
+    Value: !GetAtt MasterInstance.PrivateIp
+  SlavePrivateIP:
+    Description: Slave 节点私有 IP
+    Value: !GetAtt SlaveInstance.PrivateIp
